@@ -18,6 +18,8 @@ import { useSession } from "./session";
 import { aggregateNotifications } from "./notifications";
 import { loadRecap, saveRecap } from "./recap-record";
 import type { RecapRecord } from "./recap-record";
+import { resolveRecapProfiles, useRecentRecaps } from "./jetstream";
+import type { ResolvedRecap } from "./jetstream";
 import "./App.css";
 
 const SLIDE_DURATION_MS = 6000;
@@ -53,9 +55,15 @@ function monthLabel(m: MonthValue): string {
   return `${m.year}年${m.month + 1}月`;
 }
 
+function getShareUrl(handle: string): string {
+  const base = `${window.location.origin}${window.location.pathname}`;
+  return `${base}?handle=${encodeURIComponent(handle)}`;
+}
+
 export default function App() {
   const sess = useSession();
   const [input, setInput] = useState("");
+  const urlHandleProcessed = useRef(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [profile, setProfile] = useState<Profile | null>(null);
@@ -67,6 +75,22 @@ export default function App() {
   const [signingIn, setSigningIn] = useState(false);
 
   const recapMonth = useMemo<MonthValue>(() => defaultMonth(), []);
+
+  // URL ?handle=xxx があれば自動で分析開始
+  useEffect(() => {
+    if (urlHandleProcessed.current) return;
+    if (!sess.ready) return;
+    const params = new URLSearchParams(window.location.search);
+    const handleParam = params.get("handle");
+    if (handleParam) {
+      urlHandleProcessed.current = true;
+      const normalized = normalizeHandle(handleParam);
+      setInput(normalized);
+      void runAnonymous(normalized);
+      // URL からクエリを消して、リロード時に再発火しないようにする
+      window.history.replaceState({}, "", window.location.pathname);
+    }
+  }, [sess.ready]); // eslint-disable-line react-hooks/exhaustive-deps
 
   async function analyzeAuthenticated(): Promise<void> {
     if (!sess.agent || !sess.did) return;
@@ -150,7 +174,10 @@ export default function App() {
 
   async function analyzeAnonymous(e: FormEvent) {
     e.preventDefault();
-    const handle = normalizeHandle(input);
+    await runAnonymous(normalizeHandle(input));
+  }
+
+  async function runAnonymous(handle: string): Promise<void> {
     if (!handle) return;
     setLoading(true);
     setError(null);
@@ -376,6 +403,13 @@ export default function App() {
           )}
 
           {error && <div className="error">⚠ {error}</div>}
+
+          <RecentRecapsStrip
+            onPick={(handle) => {
+              setInput(handle);
+              void runAnonymous(handle);
+            }}
+          />
         </div>
       </div>
     );
@@ -748,12 +782,11 @@ interface ReactionProps {
 }
 
 function LikesSlide({ summary, engagers, authenticated }: ReactionProps) {
-  const top3 = authenticated
-    ? [...engagers]
-        .filter((e) => e.likes > 0)
-        .sort((a, b) => b.likes - a.likes)
-        .slice(0, 3)
-    : [];
+  const matched = [...engagers]
+    .filter((e) => e.likes > 0)
+    .sort((a, b) => b.likes - a.likes);
+  const top3 = authenticated ? matched.slice(0, 3) : [];
+  const sample = authenticated ? [] : matched.slice(0, 12);
   return (
     <SplitReactionSlide
       gradient="grad-red"
@@ -767,17 +800,18 @@ function LikesSlide({ summary, engagers, authenticated }: ReactionProps) {
       countIcon="♥"
       emptyText="まだ いいねはありません"
       authenticated={authenticated}
+      sampleAvatars={sample}
+      sampleLabel="♥ してくれた人たち"
     />
   );
 }
 
 function RepostsSlide({ summary, engagers, authenticated }: ReactionProps) {
-  const top3 = authenticated
-    ? [...engagers]
-        .filter((e) => e.reposts > 0)
-        .sort((a, b) => b.reposts - a.reposts)
-        .slice(0, 3)
-    : [];
+  const matched = [...engagers]
+    .filter((e) => e.reposts > 0)
+    .sort((a, b) => b.reposts - a.reposts);
+  const top3 = authenticated ? matched.slice(0, 3) : [];
+  const sample = authenticated ? [] : matched.slice(0, 12);
   return (
     <SplitReactionSlide
       gradient="grad-green"
@@ -791,6 +825,8 @@ function RepostsSlide({ summary, engagers, authenticated }: ReactionProps) {
       countIcon="🔁"
       emptyText="まだ リポストはありません"
       authenticated={authenticated}
+      sampleAvatars={sample}
+      sampleLabel="🔁 してくれた人たち"
     />
   );
 }
@@ -807,6 +843,8 @@ interface SplitReactionProps {
   countIcon: string;
   emptyText: string;
   authenticated: boolean;
+  sampleAvatars: Engager[];
+  sampleLabel: string;
 }
 
 function SplitReactionSlide({
@@ -821,6 +859,8 @@ function SplitReactionSlide({
   countIcon,
   emptyText,
   authenticated,
+  sampleAvatars,
+  sampleLabel,
 }: SplitReactionProps) {
   return (
     <div className={`card ${gradient} fill`}>
@@ -873,11 +913,39 @@ function SplitReactionSlide({
                 </ul>
               )}
             </>
+          ) : sampleAvatars.length > 0 ? (
+            <div className="sample-cluster">
+              <div className="card-label small-label">{sampleLabel}</div>
+              <div className="sample-grid">
+                {sampleAvatars.map((e) => (
+                  <a
+                    key={e.did}
+                    className="sample-avatar"
+                    href={`https://bsky.app/profile/${e.handle}`}
+                    target="_blank"
+                    rel="noreferrer"
+                    title={`@${e.handle}`}
+                    onPointerDown={(ev) => ev.stopPropagation()}
+                  >
+                    {e.avatar ? (
+                      <img src={e.avatar} alt="" loading="lazy" />
+                    ) : (
+                      <div className="sample-fallback">
+                        {e.handle.charAt(0).toUpperCase()}
+                      </div>
+                    )}
+                  </a>
+                ))}
+              </div>
+              <div className="sample-note">
+                ログインすると Top 3 が見れます
+              </div>
+            </div>
           ) : (
             <div className="auth-prompt">
               <div className="auth-prompt-icon">🔒</div>
               <div className="auth-prompt-text">
-                ログインすると上位 3人 が見れます
+                {emoji} してくれた人はまだ検出されていません
               </div>
             </div>
           )}
@@ -994,17 +1062,20 @@ function HeatmapRow({ bin, row, max }: HeatmapRowProps) {
       {row.map((count, d) => {
         const intensity = max > 0 ? count / max : 0;
         const alpha = count > 0 ? Math.max(0.14, intensity * 0.95) : 0;
+        const isPeak = count > 0 && count === max;
         return (
           <div
             key={d}
-            className="heatmap-cell"
+            className={`heatmap-cell ${isPeak ? "heatmap-peak" : ""}`}
             style={{
               background:
                 count > 0
                   ? `rgba(96, 165, 250, ${alpha})`
                   : "rgba(255,255,255,0.03)",
             }}
-            title={`${WEEKDAYS[d]} ${hourStart}-${hourStart + 1}時: ${count}件`}
+            title={`${WEEKDAYS[d]} ${hourStart}-${hourStart + 1}時: ${count}件${
+              isPeak ? " (ピーク)" : ""
+            }`}
           >
             {count > 0 && max <= 9 ? (
               <span className="heatmap-count">{count}</span>
@@ -1149,7 +1220,10 @@ function SummarySlide({
     <div className="card card-summary fill">
       <div className="card-body summary-body">
         <div className="summary-head">
-          <div className="summary-month">{monthLabel} · RECAP</div>
+          <div className="summary-month-row">
+            <div className="summary-month">{monthLabel} · RECAP</div>
+            <ShareButton handle={profile.handle} />
+          </div>
           <div className="summary-profile">
             {profile.avatar && (
               <img
@@ -1239,6 +1313,47 @@ function SummarySlide({
   );
 }
 
+function ShareButton({ handle }: { handle: string }) {
+  const [copied, setCopied] = useState(false);
+  const url = getShareUrl(handle);
+
+  async function copy(e: React.MouseEvent) {
+    e.stopPropagation();
+    try {
+      await navigator.clipboard.writeText(url);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      // フォールバック: 古いブラウザ等
+      const ta = document.createElement("textarea");
+      ta.value = url;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      try {
+        document.execCommand("copy");
+        setCopied(true);
+        setTimeout(() => setCopied(false), 2000);
+      } catch {
+        // 何もしない
+      }
+      document.body.removeChild(ta);
+    }
+  }
+
+  return (
+    <button
+      className="share-btn"
+      onClick={copy}
+      onPointerDown={(e) => e.stopPropagation()}
+      aria-label="リンクをコピー"
+    >
+      {copied ? "✓ リンクをコピーしました" : "🔗 リンクをコピー"}
+    </button>
+  );
+}
+
 function SummaryStat({
   label,
   value,
@@ -1254,6 +1369,59 @@ function SummaryStat({
         {value.toLocaleString()}
       </div>
       <div className="summary-stat-label">{label}</div>
+    </div>
+  );
+}
+
+/* ================
+   最近のレキャップ (Jetstream)
+   ================ */
+
+function RecentRecapsStrip({
+  onPick,
+}: {
+  onPick: (handle: string) => void;
+}) {
+  const events = useRecentRecaps(true);
+  const [resolved, setResolved] = useState<ResolvedRecap[]>([]);
+
+  useEffect(() => {
+    if (events.length === 0) return;
+    let cancelled = false;
+    resolveRecapProfiles(events).then((rs) => {
+      if (!cancelled) setResolved(rs);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [events]);
+
+  if (resolved.length === 0) return null;
+
+  return (
+    <div className="recent-strip">
+      <div className="recent-label">最近のレキャップ</div>
+      <div className="recent-list">
+        {resolved.map((r) => (
+          <button
+            key={`${r.did}-${r.rkey}`}
+            className="recent-item"
+            onClick={() => onPick(r.handle)}
+            title={`@${r.handle} · ${r.rkey}`}
+          >
+            {r.avatar ? (
+              <img className="recent-avatar" src={r.avatar} alt="" />
+            ) : (
+              <div className="recent-avatar recent-fallback">
+                {r.handle.charAt(0).toUpperCase()}
+              </div>
+            )}
+            <div className="recent-handle">
+              @{r.handle.split(".")[0]}
+            </div>
+          </button>
+        ))}
+      </div>
     </div>
   );
 }
