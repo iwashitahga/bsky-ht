@@ -59,6 +59,98 @@ export type AnalyzedPost = {
   mentions: string[];
 };
 
+export type Engager = {
+  did: string;
+  handle: string;
+  avatar?: string;
+  displayName?: string;
+  likes: number;
+  reposts: number;
+};
+
+type ActorLite = {
+  did: string;
+  handle: string;
+  avatar?: string;
+  displayName?: string;
+};
+
+export async function fetchEngagers(
+  postUris: string[],
+  excludeDid: string,
+): Promise<Engager[]> {
+  const map = new Map<string, Engager>();
+
+  const tasks: Promise<void>[] = [];
+  for (const uri of postUris) {
+    tasks.push(
+      fetchLikers(uri).then((actors) => {
+        for (const a of actors) {
+          if (a.did === excludeDid) continue;
+          const e = map.get(a.did) ?? {
+            did: a.did,
+            handle: a.handle,
+            avatar: a.avatar,
+            displayName: a.displayName,
+            likes: 0,
+            reposts: 0,
+          };
+          e.likes++;
+          map.set(a.did, e);
+        }
+      }),
+    );
+    tasks.push(
+      fetchReposters(uri).then((actors) => {
+        for (const a of actors) {
+          if (a.did === excludeDid) continue;
+          const e = map.get(a.did) ?? {
+            did: a.did,
+            handle: a.handle,
+            avatar: a.avatar,
+            displayName: a.displayName,
+            likes: 0,
+            reposts: 0,
+          };
+          e.reposts++;
+          map.set(a.did, e);
+        }
+      }),
+    );
+  }
+
+  await Promise.all(tasks);
+  return [...map.values()].sort(
+    (a, b) => b.likes + b.reposts - (a.likes + a.reposts),
+  );
+}
+
+async function fetchLikers(postUri: string): Promise<ActorLite[]> {
+  const url = `${PUBLIC_APPVIEW}/xrpc/app.bsky.feed.getLikes?uri=${encodeURIComponent(postUri)}&limit=50`;
+  try {
+    const res = await fetch(url);
+    if (!res.ok) return [];
+    const json = (await res.json()) as {
+      likes: Array<{ actor: ActorLite }>;
+    };
+    return (json.likes ?? []).map((l) => l.actor);
+  } catch {
+    return [];
+  }
+}
+
+async function fetchReposters(postUri: string): Promise<ActorLite[]> {
+  const url = `${PUBLIC_APPVIEW}/xrpc/app.bsky.feed.getRepostedBy?uri=${encodeURIComponent(postUri)}&limit=50`;
+  try {
+    const res = await fetch(url);
+    if (!res.ok) return [];
+    const json = (await res.json()) as { repostedBy: ActorLite[] };
+    return json.repostedBy ?? [];
+  } catch {
+    return [];
+  }
+}
+
 export async function fetchProfile(handle: string): Promise<Profile> {
   const url = `${PUBLIC_APPVIEW}/xrpc/app.bsky.actor.getProfile?actor=${encodeURIComponent(handle)}`;
   const res = await fetch(url);
