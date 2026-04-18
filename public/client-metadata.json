@@ -1,0 +1,12 @@
+{
+  "client_id": "https://iwashitahga.github.io/bsky-ht/client-metadata.json",
+  "application_type": "web",
+  "client_name": "Sky Highlights",
+  "client_uri": "https://iwashitahga.github.io/bsky-ht/",
+  "dpop_bound_access_tokens": true,
+  "grant_types": ["authorization_code", "refresh_token"],
+  "redirect_uris": ["https://iwashitahga.github.io/bsky-ht/"],
+  "response_types": ["code"],
+  "scope": "atproto transition:generic",
+  "token_endpoint_auth_method": "none"
+}

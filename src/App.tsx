@@ -1,33 +1,26 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { FormEvent } from "react";
+import type { CSSProperties, FormEvent } from "react";
 import {
-  Chart as ChartJS,
-  CategoryScale,
-  LinearScale,
-  BarElement,
-  Title,
-  Tooltip,
-  Legend,
-  ArcElement,
-} from "chart.js";
-import { Bar } from "react-chartjs-2";
-import { fetchEngagers, fetchProfile, fetchRecentPosts } from "./bsky";
-import type { AnalyzedPost, Engager, Profile } from "./bsky";
+  fetchEngagers,
+  fetchNewFollows,
+  fetchPostsInRange,
+  fetchProfile,
+} from "./bsky";
+import type {
+  AnalyzedPost,
+  Engager,
+  NewFollow,
+  Profile,
+} from "./bsky";
 import { summarize } from "./analyze";
-import type { DayBucket, Summary } from "./analyze";
+import type { Summary } from "./analyze";
+import { useSession } from "./session";
+import { aggregateNotifications } from "./notifications";
+import { loadRecap, saveRecap } from "./recap-record";
+import type { RecapRecord } from "./recap-record";
 import "./App.css";
 
-ChartJS.register(
-  CategoryScale,
-  LinearScale,
-  BarElement,
-  Title,
-  Tooltip,
-  Legend,
-  ArcElement,
-);
-
-const DAYS = 7;
+const SLIDE_DURATION_MS = 6000;
 
 function normalizeHandle(raw: string): string {
   let h = raw
@@ -43,22 +36,119 @@ function normalizeHandle(raw: string): string {
   return h;
 }
 
+interface MonthValue {
+  year: number;
+  month: number;
+}
+
+function defaultMonth(): MonthValue {
+  const now = new Date();
+  if (now.getMonth() === 0) {
+    return { year: now.getFullYear() - 1, month: 11 };
+  }
+  return { year: now.getFullYear(), month: now.getMonth() - 1 };
+}
+
+function monthLabel(m: MonthValue): string {
+  return `${m.year}年${m.month + 1}月`;
+}
+
 export default function App() {
+  const sess = useSession();
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [profile, setProfile] = useState<Profile | null>(null);
   const [summary, setSummary] = useState<Summary | null>(null);
-  const [posts, setPosts] = useState<AnalyzedPost[]>([]);
   const [engagers, setEngagers] = useState<Engager[]>([]);
+  const [newFollows, setNewFollows] = useState<NewFollow[]>([]);
+  const [authenticated, setAuthenticated] = useState(false);
+  const [persisted, setPersisted] = useState(false);
+  const [signingIn, setSigningIn] = useState(false);
 
-  const sortedPosts = useMemo(
-    () =>
-      [...posts].sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime()),
-    [posts],
-  );
+  const recapMonth = useMemo<MonthValue>(() => defaultMonth(), []);
 
-  async function onSubmit(e: FormEvent) {
+  async function analyzeAuthenticated(): Promise<void> {
+    if (!sess.agent || !sess.did) return;
+    setLoading(true);
+    setError(null);
+    setProfile(null);
+    setSummary(null);
+    setEngagers([]);
+    setNewFollows([]);
+    setAuthenticated(true);
+    setPersisted(false);
+
+    try {
+      const rangeStart = new Date(recapMonth.year, recapMonth.month, 1);
+      const rangeEnd = new Date(
+        recapMonth.year,
+        recapMonth.month + 1,
+        1,
+      );
+      const startMs = rangeStart.getTime();
+      const endMs = rangeEnd.getTime() - 1;
+
+      const prof = await sess.agent.getProfile({ actor: sess.did });
+      const p: Profile = {
+        did: prof.data.did,
+        handle: prof.data.handle,
+        displayName: prof.data.displayName,
+        avatar: prof.data.avatar,
+        description: prof.data.description,
+        followersCount: prof.data.followersCount,
+        followsCount: prof.data.followsCount,
+        postsCount: prof.data.postsCount,
+      };
+      setProfile(p);
+
+      // 既存レキャップがあればまず表示
+      const existing = await loadRecap(sess.agent, sess.did, rangeStart);
+      if (existing) {
+        applyRecord(existing, p, rangeStart, rangeEnd);
+        setPersisted(true);
+      }
+
+      // 新規計算（常に再計算して上書き保存）
+      const [posts, notif] = await Promise.all([
+        fetchPostsInRange(sess.did, startMs, endMs),
+        aggregateNotifications(sess.agent, startMs, endMs),
+      ]);
+
+      const sum = summarize(posts, rangeStart, rangeEnd);
+      // notifications の実測値で上書き
+      sum.totalLikes = notif.likesTotal;
+      sum.totalReposts = notif.repostsTotal;
+      sum.totalReplies = notif.repliesTotal;
+      sum.totalQuotes = notif.quotesTotal;
+
+      setSummary(sum);
+      setEngagers(notif.engagers);
+      setNewFollows(notif.newFollows);
+
+      // PDS に保存
+      try {
+        await saveRecap({
+          agent: sess.agent,
+          did: sess.did,
+          monthStart: rangeStart,
+          monthLabel: monthLabel(recapMonth),
+          summary: sum,
+          engagers: notif.engagers,
+          newFollows: notif.newFollows,
+        });
+        setPersisted(true);
+      } catch (e) {
+        console.warn("saveRecap failed", e);
+      }
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : "予期しないエラー");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function analyzeAnonymous(e: FormEvent) {
     e.preventDefault();
     const handle = normalizeHandle(input);
     if (!handle) return;
@@ -66,15 +156,25 @@ export default function App() {
     setError(null);
     setProfile(null);
     setSummary(null);
-    setPosts([]);
     setEngagers([]);
+    setNewFollows([]);
+    setAuthenticated(false);
+    setPersisted(false);
     try {
       const p = await fetchProfile(handle);
       setProfile(p);
-      const sinceMs = Date.now() - DAYS * 24 * 60 * 60 * 1000;
-      const fetched = await fetchRecentPosts(p.did, sinceMs);
-      setPosts(fetched);
-      setSummary(summarize(fetched, DAYS));
+
+      const rangeStart = new Date(recapMonth.year, recapMonth.month, 1);
+      const rangeEnd = new Date(
+        recapMonth.year,
+        recapMonth.month + 1,
+        1,
+      );
+      const startMs = rangeStart.getTime();
+      const endMs = rangeEnd.getTime() - 1;
+
+      const fetched = await fetchPostsInRange(p.did, startMs, endMs);
+      setSummary(summarize(fetched, rangeStart, rangeEnd));
 
       const topEngaged = fetched
         .filter(
@@ -82,7 +182,8 @@ export default function App() {
             f.kind !== "repost" && (f.likeCount > 0 || f.repostCount > 0),
         )
         .sort(
-          (a, b) => b.likeCount + b.repostCount - (a.likeCount + a.repostCount),
+          (a, b) =>
+            b.likeCount + b.repostCount - (a.likeCount + a.repostCount),
         )
         .slice(0, 15);
       if (topEngaged.length > 0) {
@@ -93,6 +194,10 @@ export default function App() {
           .then(setEngagers)
           .catch(() => {});
       }
+
+      fetchNewFollows(p.did, startMs, endMs)
+        .then(setNewFollows)
+        .catch(() => {});
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : "予期しないエラー");
     } finally {
@@ -100,45 +205,176 @@ export default function App() {
     }
   }
 
+  function applyRecord(
+    record: RecapRecord,
+    p: Profile,
+    rangeStart: Date,
+    rangeEnd: Date,
+  ): void {
+    const sum: Summary = {
+      total: record.posts,
+      byKind: { original: 0, reply: 0, repost: 0, quote: 0 },
+      totalLikes: record.likes,
+      totalReposts: record.reposts,
+      totalReplies: record.replies,
+      totalQuotes: record.quotes,
+      heatmap: record.heatmap,
+      heatmapMax: record.heatmapMax,
+      mostLiked: record.mostLikedUri
+        ? {
+            uri: record.mostLikedUri,
+            createdAt: new Date(),
+            kind: "original",
+            text: record.mostLikedText ?? "",
+            likeCount: record.mostLikedLikes ?? 0,
+            repostCount: 0,
+            replyCount: 0,
+            quoteCount: 0,
+            hashtags: [],
+            mentions: [],
+          }
+        : undefined,
+      rangeStart,
+      rangeEnd,
+    };
+    setSummary(sum);
+    setEngagers(
+      record.topEngagers.map((e) => ({
+        did: e.did,
+        handle: e.handleSnapshot,
+        displayName: e.displayNameSnapshot,
+        avatar: e.avatarSnapshot,
+        likes: e.likes,
+        reposts: e.reposts,
+      })),
+    );
+    setNewFollows(
+      record.newFollows.map((f) => ({
+        did: f.did,
+        handle: f.handleSnapshot,
+        displayName: f.displayNameSnapshot,
+        avatar: f.avatarSnapshot,
+        followedAt: new Date(f.followedAt),
+      })),
+    );
+    void p;
+  }
+
+  async function onSignIn() {
+    const handle = normalizeHandle(input);
+    if (!handle) {
+      setError("ハンドルを入れてください");
+      return;
+    }
+    setSigningIn(true);
+    setError(null);
+    try {
+      await sess.signIn(handle);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "ログインに失敗しました");
+      setSigningIn(false);
+    }
+  }
+
   function reset() {
     setProfile(null);
     setSummary(null);
-    setPosts([]);
     setEngagers([]);
+    setNewFollows([]);
     setError(null);
+    setAuthenticated(false);
+    setPersisted(false);
   }
 
-  const hasData = !!(summary && summary.total > 0 && profile);
+  const hasData = !!(summary && profile);
 
   if (!hasData) {
+    if (!sess.ready) {
+      return (
+        <div className="splash">
+          <div className="splash-inner">
+            <div className="splash-logo">SKY HIGHLIGHTS</div>
+            <div className="splash-sub">読み込み中…</div>
+          </div>
+        </div>
+      );
+    }
+
+    const loggedIn = !!sess.session;
+
     return (
       <div className="splash">
         <div className="splash-inner">
-          <div className="splash-logo">BSKY · WEEKLY</div>
-          <h1 className="splash-title">今週のあなたを
+          <div className="splash-logo">BSKY · MONTHLY RECAP</div>
+          <h1 className="splash-title">
+            Sky Highlights
             <br />
-            ストーリーで。
+            <span className="splash-sub-title">
+              {monthLabel(recapMonth)}を振り返る。
+            </span>
           </h1>
           <p className="splash-sub">
-            Bluesky ハンドルを入れると、過去7日間の活動を一画面ずつまとめます。
+            {loggedIn
+              ? "ログイン済みです。あなたの正確なレキャップを作成できます。"
+              : "ログインするとあなた自身の正確なレキャップが作れます。未ログインでも他の人のハンドルを覗けます。"}
           </p>
-          <form className="form" onSubmit={onSubmit}>
-            <input
-              type="text"
-              placeholder="ハンドル (例: bsky.app)"
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              autoFocus
-            />
-            <button type="submit" disabled={loading || !input.trim()}>
-              {loading ? "…" : "見る"}
-            </button>
-          </form>
-          {summary && summary.total === 0 && (
-            <div className="splash-empty">
-              過去7日間の投稿・リポストは見つかりませんでした。
+
+          {loggedIn ? (
+            <div className="auth-box">
+              <button
+                type="button"
+                className="btn-primary"
+                onClick={analyzeAuthenticated}
+                disabled={loading}
+              >
+                {loading ? "作成中…" : "自分のレキャップを見る"}
+              </button>
+              <button
+                type="button"
+                className="btn-secondary"
+                onClick={sess.signOut}
+              >
+                ログアウト
+              </button>
             </div>
+          ) : (
+            <>
+              <div className="auth-box">
+                <input
+                  type="text"
+                  className="handle-input"
+                  placeholder="alice.bsky.social"
+                  value={input}
+                  onChange={(e) => setInput(e.target.value)}
+                  autoFocus
+                />
+                <button
+                  type="button"
+                  className="btn-primary"
+                  onClick={onSignIn}
+                  disabled={signingIn || !input.trim()}
+                >
+                  {signingIn ? "遷移中…" : "Bluesky でログイン"}
+                </button>
+              </div>
+              <div className="divider">または</div>
+              <form className="form" onSubmit={analyzeAnonymous}>
+                <input
+                  type="text"
+                  placeholder="他の人のハンドル (例: bsky.app)"
+                  value={input}
+                  onChange={(e) => setInput(e.target.value)}
+                />
+                <button type="submit" disabled={loading || !input.trim()}>
+                  {loading ? "…" : "見る"}
+                </button>
+              </form>
+              <div className="auth-note">
+                未ログインの場合は Top 3 は表示されません
+              </div>
+            </>
           )}
+
           {error && <div className="error">⚠ {error}</div>}
         </div>
       </div>
@@ -149,8 +385,11 @@ export default function App() {
     <StoryViewer
       profile={profile!}
       summary={summary!}
-      posts={sortedPosts}
       engagers={engagers}
+      newFollows={newFollows}
+      monthLabel={monthLabel(recapMonth)}
+      authenticated={authenticated}
+      persisted={persisted}
       onReset={reset}
     />
   );
@@ -159,20 +398,33 @@ export default function App() {
 interface StoryViewerProps {
   profile: Profile;
   summary: Summary;
-  posts: AnalyzedPost[];
   engagers: Engager[];
+  newFollows: NewFollow[];
+  monthLabel: string;
+  authenticated: boolean;
+  persisted: boolean;
   onReset: () => void;
+}
+
+interface Slide {
+  key: string;
+  render: () => React.ReactNode;
 }
 
 function StoryViewer({
   profile,
   summary,
-  posts,
   engagers,
+  newFollows,
+  monthLabel,
+  authenticated,
+  persisted,
   onReset,
 }: StoryViewerProps) {
   const viewportRef = useRef<HTMLDivElement>(null);
   const [active, setActive] = useState(0);
+  const [paused, setPaused] = useState(false);
+  const [elapsed, setElapsed] = useState(0);
 
   const slides = useMemo<Slide[]>(() => {
     const items: Slide[] = [
@@ -181,7 +433,7 @@ function StoryViewer({
         render: () => (
           <IntroSlide
             profile={profile}
-            summary={summary}
+            monthLabel={monthLabel}
             engagers={engagers}
           />
         ),
@@ -189,78 +441,36 @@ function StoryViewer({
       {
         key: "likes",
         render: () => (
-          <EngagementSlide
-            icon="♥"
-            label="受け取ったいいね"
-            value={summary.totalLikes}
-            avgBase={summary.total}
-            gradient="grad-red"
-            caption={engagementCaption(summary.totalLikes)}
+          <LikesSlide
+            summary={summary}
+            engagers={engagers}
+            authenticated={authenticated}
           />
         ),
       },
       {
         key: "reposts",
         render: () => (
-          <EngagementSlide
-            icon="🔁"
-            label="リポストされた数"
-            value={summary.totalReposts}
-            avgBase={summary.total}
-            gradient="grad-green"
-            caption="あなたの投稿が広がった回数"
+          <RepostsSlide
+            summary={summary}
+            engagers={engagers}
+            authenticated={authenticated}
           />
         ),
       },
       {
-        key: "replies",
-        render: () => (
-          <EngagementSlide
-            icon="💬"
-            label="リプライされた数"
-            value={summary.totalReplies}
-            avgBase={summary.total}
-            gradient="grad-amber"
-            caption="会話が生まれた回数"
-          />
-        ),
+        key: "conversations",
+        render: () => <ConversationsSlide summary={summary} />,
       },
       {
-        key: "quotes",
-        render: () => (
-          <EngagementSlide
-            icon="❝"
-            label="引用された数"
-            value={summary.totalQuotes}
-            avgBase={summary.total}
-            gradient="grad-purple"
-            caption="引用投稿された回数"
-          />
-        ),
+        key: "heatmap",
+        render: () => <HeatmapSlide summary={summary} />,
       },
       {
-        key: "count",
-        render: () => (
-          <BigStatSlide
-            label="週間投稿"
-            value={summary.total}
-            suffix="件"
-            gradient="grad-pink"
-            caption={captionForPostCount(summary.total)}
-          />
-        ),
+        key: "follows",
+        render: () => <NewFollowsSlide follows={newFollows} />,
       },
-      { key: "daily", render: () => <DailyChartSlide summary={summary} /> },
-      { key: "busy", render: () => <BusiestDaySlide summary={summary} /> },
-      { key: "peak", render: () => <PeakHourSlide summary={summary} /> },
-      { key: "kind", render: () => <KindSlide summary={summary} /> },
     ];
-    if (summary.topHashtags.length > 0) {
-      items.push({ key: "tags", render: () => <HashtagSlide summary={summary} /> });
-    }
-    if (summary.topMentions.length > 0) {
-      items.push({ key: "mentions", render: () => <MentionSlide summary={summary} /> });
-    }
     if (summary.mostLiked) {
       items.push({
         key: "top",
@@ -270,11 +480,21 @@ function StoryViewer({
       });
     }
     items.push({
-      key: "feed",
-      render: () => <FeedSlide posts={posts} profile={profile} />,
+      key: "summary",
+      render: () => (
+        <SummarySlide
+          profile={profile}
+          summary={summary}
+          engagers={engagers}
+          newFollows={newFollows}
+          monthLabel={monthLabel}
+          authenticated={authenticated}
+          persisted={persisted}
+        />
+      ),
     });
     return items;
-  }, [profile, summary, posts, engagers]);
+  }, [profile, summary, engagers, newFollows, monthLabel, authenticated, persisted]);
 
   useEffect(() => {
     const el = viewportRef.current;
@@ -294,17 +514,70 @@ function StoryViewer({
     el.scrollTo({ left: clamped * el.clientWidth, behavior: "smooth" });
   }
 
+  // Reset elapsed when slide changes
+  useEffect(() => {
+    setElapsed(0);
+  }, [active]);
+
+  // Auto-advance timer
+  useEffect(() => {
+    if (paused) return;
+    if (active >= slides.length - 1 && elapsed >= SLIDE_DURATION_MS) return;
+    const TICK_MS = 50;
+    const interval = setInterval(() => {
+      setElapsed((prev) => {
+        const next = prev + TICK_MS;
+        if (next >= SLIDE_DURATION_MS) {
+          clearInterval(interval);
+          if (active < slides.length - 1) {
+            setTimeout(() => goto(active + 1), 0);
+          }
+          return SLIDE_DURATION_MS;
+        }
+        return next;
+      });
+    }, TICK_MS);
+    return () => clearInterval(interval);
+  }, [paused, active, slides.length]);
+
+  function handlePointerDown() {
+    setPaused(true);
+  }
+  function handlePointerUp() {
+    setPaused(false);
+  }
+
   return (
-    <div className="viewer">
+    <div
+      className="viewer"
+      onPointerDown={handlePointerDown}
+      onPointerUp={handlePointerUp}
+      onPointerCancel={handlePointerUp}
+      onPointerLeave={handlePointerUp}
+    >
       <header className="viewer-header">
         <div className="progress">
-          {slides.map((s, i) => (
-            <span
-              key={s.key}
-              className={`progress-bar ${i <= active ? "on" : ""}`}
-              onClick={() => goto(i)}
-            />
-          ))}
+          {slides.map((s, i) => {
+            let fillPct = 0;
+            if (i < active) fillPct = 100;
+            else if (i === active)
+              fillPct = (elapsed / SLIDE_DURATION_MS) * 100;
+            return (
+              <span
+                key={s.key}
+                className="progress-bar"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  goto(i);
+                }}
+              >
+                <span
+                  className="progress-fill"
+                  style={{ width: `${fillPct}%` }}
+                />
+              </span>
+            );
+          })}
         </div>
         <div className="viewer-user">
           {profile.avatar && (
@@ -314,12 +587,18 @@ function StoryViewer({
             <div className="viewer-name">
               {profile.displayName || profile.handle}
             </div>
-            <div className="viewer-handle">@{profile.handle}</div>
+            <div className="viewer-handle">
+              @{profile.handle} · {monthLabel}
+            </div>
           </div>
           <button
             className="reset"
-            onClick={onReset}
-            aria-label="別のハンドルで見る"
+            onClick={(e) => {
+              e.stopPropagation();
+              onReset();
+            }}
+            onPointerDown={(e) => e.stopPropagation()}
+            aria-label="戻る"
           >
             ×
           </button>
@@ -327,7 +606,11 @@ function StoryViewer({
       </header>
       <button
         className="nav prev"
-        onClick={() => goto(active - 1)}
+        onClick={(e) => {
+          e.stopPropagation();
+          goto(active - 1);
+        }}
+        onPointerDown={(e) => e.stopPropagation()}
         disabled={active === 0}
         aria-label="前へ"
       >
@@ -335,7 +618,11 @@ function StoryViewer({
       </button>
       <button
         className="nav next"
-        onClick={() => goto(active + 1)}
+        onClick={(e) => {
+          e.stopPropagation();
+          goto(active + 1);
+        }}
+        onPointerDown={(e) => e.stopPropagation()}
         disabled={active === slides.length - 1}
         aria-label="次へ"
       >
@@ -352,68 +639,40 @@ function StoryViewer({
   );
 }
 
-interface Slide {
-  key: string;
-  render: () => React.ReactNode;
-}
-
-function engagementCaption(v: number): string {
-  if (v >= 1000) return "今週、めちゃくちゃ届いています";
-  if (v >= 100) return "しっかりとリアクションが";
-  if (v >= 10) return "ちょっとずつ届いています";
-  return "ゆっくりと";
-}
-
-function captionForPostCount(n: number): string {
-  if (n >= 100) return "めちゃくちゃ活発な一週間";
-  if (n >= 50) return "とても活発な一週間";
-  if (n >= 20) return "順調に活動中";
-  if (n >= 7) return "毎日ちょこちょこ";
-  return "ゆるめのペース";
-}
-
-function avg(a: number, b: number): string {
-  if (!b) return "0";
-  return (a / b).toFixed(1);
-}
-
 /* ================
-   Slide components
+   1. Intro
    ================ */
 
 interface IntroProps {
   profile: Profile;
-  summary: Summary;
+  monthLabel: string;
   engagers: Engager[];
 }
 
 const SCATTER_TL = [
-  { top: "3%", left: "4%", size: 78 },
-  { top: "2%", left: "34%", size: 54 },
+  { top: "3%", left: "4%", size: 76 },
+  { top: "2%", left: "34%", size: 52 },
   { top: "17%", left: "14%", size: 62 },
   { top: "14%", left: "42%", size: 44 },
   { top: "28%", left: "4%", size: 50 },
   { top: "29%", left: "30%", size: 58 },
-  { top: "6%", left: "58%", size: 48 },
+  { top: "6%", left: "58%", size: 46 },
   { top: "22%", left: "58%", size: 40 },
 ];
 
 const SCATTER_BR = [
-  { bottom: "3%", right: "4%", size: 78 },
-  { bottom: "2%", right: "34%", size: 54 },
+  { bottom: "3%", right: "4%", size: 76 },
+  { bottom: "2%", right: "34%", size: 52 },
   { bottom: "17%", right: "14%", size: 62 },
   { bottom: "14%", right: "42%", size: 44 },
   { bottom: "28%", right: "4%", size: 50 },
   { bottom: "29%", right: "30%", size: 58 },
-  { bottom: "6%", right: "58%", size: 48 },
+  { bottom: "6%", right: "58%", size: 46 },
   { bottom: "22%", right: "58%", size: 40 },
 ];
 
-function IntroSlide({ profile, summary, engagers }: IntroProps) {
-  const first = summary.days[0]?.label;
-  const last = summary.days[summary.days.length - 1]?.label;
+function IntroSlide({ profile, monthLabel, engagers }: IntroProps) {
   const displayName = profile.displayName || profile.handle.split(".")[0];
-
   const tl = engagers.slice(0, SCATTER_TL.length);
   const br = engagers.slice(
     SCATTER_TL.length,
@@ -434,16 +693,12 @@ function IntroSlide({ profile, summary, engagers }: IntroProps) {
       </div>
       <div className="card-body intro-body">
         <div className="intro-center">
-          <div className="card-label">2026 weekly recap</div>
+          <div className="card-label">{monthLabel} recap</div>
           <div className="intro-title">
             <span className="intro-name-accent">{displayName}</span>
-            <br />
-            の一週間を
+            <br />の{monthLabel.split("年")[1]}を
             <br />
             振り返りましょう
-          </div>
-          <div className="intro-range">
-            {first} 〜 {last}
           </div>
           {engagers.length > 0 && (
             <div className="intro-engagers-note">
@@ -459,7 +714,7 @@ function IntroSlide({ profile, summary, engagers }: IntroProps) {
 
 interface ScatterAvatarProps {
   engager: Engager;
-  style: React.CSSProperties & { size: number };
+  style: { size: number } & CSSProperties;
 }
 
 function ScatterAvatar({ engager, style }: ScatterAvatarProps) {
@@ -482,252 +737,361 @@ function ScatterAvatar({ engager, style }: ScatterAvatarProps) {
   );
 }
 
-interface EngagementSlideProps {
-  icon: string;
-  label: string;
-  value: number;
-  avgBase: number;
-  gradient: string;
-  caption: string;
+/* ================
+   2. Likes (件数 + top 3)
+   ================ */
+
+interface ReactionProps {
+  summary: Summary;
+  engagers: Engager[];
+  authenticated: boolean;
 }
 
-function EngagementSlide({
-  icon,
-  label,
-  value,
-  avgBase,
+function LikesSlide({ summary, engagers, authenticated }: ReactionProps) {
+  const top3 = authenticated
+    ? [...engagers]
+        .filter((e) => e.likes > 0)
+        .sort((a, b) => b.likes - a.likes)
+        .slice(0, 3)
+    : [];
+  return (
+    <SplitReactionSlide
+      gradient="grad-red"
+      label="likes"
+      emoji="♥"
+      count={summary.totalLikes}
+      countCaption="受け取ったいいね"
+      top3Label="top 3 — いちばん ♥ してくれた人"
+      top3={top3}
+      countKey="likes"
+      countIcon="♥"
+      emptyText="まだ いいねはありません"
+      authenticated={authenticated}
+    />
+  );
+}
+
+function RepostsSlide({ summary, engagers, authenticated }: ReactionProps) {
+  const top3 = authenticated
+    ? [...engagers]
+        .filter((e) => e.reposts > 0)
+        .sort((a, b) => b.reposts - a.reposts)
+        .slice(0, 3)
+    : [];
+  return (
+    <SplitReactionSlide
+      gradient="grad-green"
+      label="reposts"
+      emoji="🔁"
+      count={summary.totalReposts}
+      countCaption="受け取ったリポスト"
+      top3Label="top 3 — いちばん 🔁 してくれた人"
+      top3={top3}
+      countKey="reposts"
+      countIcon="🔁"
+      emptyText="まだ リポストはありません"
+      authenticated={authenticated}
+    />
+  );
+}
+
+interface SplitReactionProps {
+  gradient: string;
+  label: string;
+  emoji: string;
+  count: number;
+  countCaption: string;
+  top3Label: string;
+  top3: Engager[];
+  countKey: "likes" | "reposts";
+  countIcon: string;
+  emptyText: string;
+  authenticated: boolean;
+}
+
+function SplitReactionSlide({
   gradient,
-  caption,
-}: EngagementSlideProps) {
+  label,
+  emoji,
+  count,
+  countCaption,
+  top3Label,
+  top3,
+  countKey,
+  countIcon,
+  emptyText,
+  authenticated,
+}: SplitReactionProps) {
   return (
     <div className={`card ${gradient} fill`}>
-      <div className="card-body center">
-        <div className="eng-icon">{icon}</div>
-        <div className="card-label">{label}</div>
-        <div className="huge-number">{value.toLocaleString()}</div>
-        <div className="card-caption">
-          {caption}
-          <br />
-          <span className="sub-caption">
-            1投稿あたり 平均 {avg(value, avgBase)}
-          </span>
+      <div className="card-body split-body">
+        <div className="split-top">
+          <div className="card-label">{label}</div>
+          <div className="reaction-emojis">
+            <span className="reaction-emoji">{emoji}</span>
+          </div>
+          <div className="huge-number">
+            <span>{count.toLocaleString()}</span>
+          </div>
+          <div className="reaction-caption">{countCaption}</div>
+        </div>
+        <div className="split-bottom">
+          {authenticated ? (
+            <>
+              <div className="card-label small-label">{top3Label}</div>
+              {top3.length === 0 ? (
+                <div className="rank-empty">{emptyText}</div>
+              ) : (
+                <ul className="rank-list">
+                  {top3.map((e, i) => (
+                    <li key={e.did} className={`rank-item rank-${i + 1}`}>
+                      <div className="rank-badge">{i + 1}</div>
+                      {e.avatar ? (
+                        <img
+                          className="rank-avatar"
+                          src={e.avatar}
+                          alt=""
+                          loading="lazy"
+                        />
+                      ) : (
+                        <div className="rank-avatar rank-fallback">
+                          {e.handle.charAt(0).toUpperCase()}
+                        </div>
+                      )}
+                      <div className="rank-info">
+                        <div className="rank-name">
+                          {e.displayName || e.handle}
+                        </div>
+                        <div className="rank-handle">@{e.handle}</div>
+                      </div>
+                      <div className="rank-count">
+                        <span className="rank-count-icon">{countIcon}</span>
+                        {e[countKey]}
+                      </div>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </>
+          ) : (
+            <div className="auth-prompt">
+              <div className="auth-prompt-icon">🔒</div>
+              <div className="auth-prompt-text">
+                ログインすると上位 3人 が見れます
+              </div>
+            </div>
+          )}
         </div>
       </div>
     </div>
   );
 }
 
-interface BigStatSlideProps {
-  label: string;
-  value: number;
-  suffix?: string;
-  gradient: string;
-  caption?: string;
-}
+/* ================
+   3. Conversations (コメント + 引用)
+   ================ */
 
-function BigStatSlide({
-  label,
-  value,
-  suffix,
-  gradient,
-  caption,
-}: BigStatSlideProps) {
+function ConversationsSlide({ summary }: { summary: Summary }) {
+  const total = summary.totalReplies + summary.totalQuotes;
   return (
-    <div className={`card ${gradient} fill`}>
+    <div className="card grad-purple fill">
       <div className="card-body center">
-        <div className="card-label">{label}</div>
+        <div className="card-label">conversations</div>
+        <div className="reaction-emojis">
+          <span className="reaction-emoji">💬</span>
+          <span className="reaction-plus">+</span>
+          <span className="reaction-emoji">❝</span>
+        </div>
         <div className="huge-number">
-          <span>{value.toLocaleString()}</span>
-          {suffix && <span className="huge-suffix">{suffix}</span>}
+          <span>{total.toLocaleString()}</span>
         </div>
-        {caption && <div className="card-caption">{caption}</div>}
-      </div>
-    </div>
-  );
-}
-
-function BusiestDaySlide({ summary }: { summary: Summary }) {
-  const busiest = summary.days.reduce<DayBucket>(
-    (best, d) => (d.total > best.total ? d : best),
-    summary.days[0],
-  );
-  return (
-    <div className="card grad-indigo fill">
-      <div className="card-body center">
-        <div className="card-label">一番活発だった日</div>
-        <div className="huge-text">{busiest.label}</div>
-        <div className="card-caption">
-          この日だけで <strong>{busiest.total}</strong>件 投稿
+        <div className="reaction-caption">会話が生まれた回数</div>
+        <div className="reaction-breakdown">
+          <div className="rb-item">
+            <span className="rb-icon">💬</span>
+            <span className="rb-value">
+              {summary.totalReplies.toLocaleString()}
+            </span>
+            <span className="rb-label">コメント</span>
+          </div>
+          <div className="rb-item">
+            <span className="rb-icon">❝</span>
+            <span className="rb-value">
+              {summary.totalQuotes.toLocaleString()}
+            </span>
+            <span className="rb-label">引用</span>
+          </div>
         </div>
       </div>
     </div>
   );
 }
 
-function PeakHourSlide({ summary }: { summary: Summary }) {
-  const peak = summary.hourly.reduce(
-    (acc, v, i) => (v > acc.v ? { v, i } : acc),
-    { v: 0, i: 0 },
-  );
-  return (
-    <div className="card grad-sky fill">
-      <div className="card-body center">
-        <div className="card-label">ピーク時間帯</div>
-        <div className="huge-number">
-          <span>{peak.i}</span>
-          <span className="huge-suffix">:00 台</span>
-        </div>
-        <div className="card-caption">
-          {hourZoneLabel(peak.i)}に最もよく投稿
-          <br />
-          <span className="sub-caption">{peak.v}件</span>
-        </div>
-      </div>
-    </div>
-  );
-}
+/* ================
+   4. Heatmap (曜日 × 時間)
+   ================ */
 
-function hourZoneLabel(h: number): string {
-  if (h >= 5 && h < 12) return "朝";
-  if (h >= 12 && h < 17) return "昼";
-  if (h >= 17 && h < 21) return "夕方";
-  return "夜";
-}
+const WEEKDAYS = ["日", "月", "火", "水", "木", "金", "土"];
 
-function DailyChartSlide({ summary }: { summary: Summary }) {
-  const data = {
-    labels: summary.days.map((d) => d.label),
-    datasets: (["original", "reply", "quote", "repost"] as const).map((k) => ({
-      label: KIND_LABEL[k],
-      data: summary.days.map((d) => d.byKind[k]),
-      backgroundColor: CHART_COLORS[k],
-      borderRadius: 4,
-    })),
-  };
+function HeatmapSlide({ summary }: { summary: Summary }) {
+  const { heatmap } = summary;
+
+  // 2時間ごとに集計（12 bins × 7 days）
+  const bins: number[][] = [];
+  let binMax = 0;
+  for (let bin = 0; bin < 12; bin++) {
+    const row = WEEKDAYS.map(
+      (_, d) => heatmap[d][bin * 2] + heatmap[d][bin * 2 + 1],
+    );
+    bins.push(row);
+    for (const v of row) if (v > binMax) binMax = v;
+  }
+
   return (
     <div className="card card-dark fill">
       <div className="card-body">
-        <div className="card-label">日別アクティビティ</div>
-        <div className="chart-fill">
-          <Bar
-            data={data}
-            options={{
-              responsive: true,
-              maintainAspectRatio: false,
-              scales: {
-                x: {
-                  stacked: true,
-                  grid: { display: false },
-                  ticks: { color: "rgba(255,255,255,0.7)" },
-                },
-                y: {
-                  stacked: true,
-                  ticks: { precision: 0, color: "rgba(255,255,255,0.5)" },
-                  grid: { color: "rgba(255,255,255,0.08)" },
-                },
-              },
-              plugins: {
-                legend: {
-                  position: "bottom",
-                  labels: {
-                    boxWidth: 10,
-                    color: "rgba(255,255,255,0.85)",
-                    font: { size: 12 },
-                  },
-                },
-              },
-            }}
-          />
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function KindSlide({ summary }: { summary: Summary }) {
-  const total = summary.total || 1;
-  const kinds = (["original", "reply", "quote", "repost"] as const).filter(
-    (k) => summary.byKind[k] > 0,
-  );
-  return (
-    <div className="card card-dark fill">
-      <div className="card-body center">
-        <div className="card-label">投稿の内訳</div>
-        <div className="kind-bar-big">
-          {kinds.map((k) => (
-            <span
-              key={k}
-              className="kind-seg"
-              style={{
-                width: `${(summary.byKind[k] / total) * 100}%`,
-                background: CHART_COLORS[k],
-              }}
+        <div className="card-label">いつ投稿してた？</div>
+        <div className="heatmap heatmap-2h">
+          <div className="heatmap-corner" />
+          {WEEKDAYS.map((d) => (
+            <div key={d} className="heatmap-day-label">
+              {d}
+            </div>
+          ))}
+          {bins.map((row, bin) => (
+            <HeatmapRow
+              key={bin}
+              bin={bin}
+              row={row}
+              max={binMax}
             />
           ))}
         </div>
-        <ul className="kind-legend">
-          {kinds.map((k) => (
-            <li key={k}>
-              <span className="dot" style={{ background: CHART_COLORS[k] }} />
-              <span>{KIND_LABEL[k]}</span>
-              <span className="kind-count">
-                {summary.byKind[k]} ·{" "}
-                {Math.round((summary.byKind[k] / total) * 100)}%
-              </span>
-            </li>
-          ))}
-        </ul>
+        <div className="heatmap-caption">
+          {summary.total > 0
+            ? `2時間ごと / 1セル最大 ${binMax}件`
+            : "この月は投稿がありませんでした"}
+        </div>
       </div>
     </div>
   );
 }
 
-function HashtagSlide({ summary }: { summary: Summary }) {
-  const top = summary.topHashtags.slice(0, 5);
+interface HeatmapRowProps {
+  bin: number;
+  row: number[];
+  max: number;
+}
+
+function HeatmapRow({ bin, row, max }: HeatmapRowProps) {
+  const hourStart = bin * 2;
   return (
-    <div className="card grad-amber fill">
-      <div className="card-body">
-        <div className="card-label">よく使うハッシュタグ</div>
-        <ul className="tag-list">
-          {top.map((t, i) => (
-            <li key={t.tag}>
-              <span className="tag-rank">#{i + 1}</span>
-              <span className="tag-label">#{t.tag}</span>
-              <span className="tag-count">{t.count}</span>
-            </li>
-          ))}
-        </ul>
+    <>
+      <div className="heatmap-hour-label">
+        {hourStart}
+        <span className="heatmap-hour-suffix">時</span>
       </div>
-    </div>
+      {row.map((count, d) => {
+        const intensity = max > 0 ? count / max : 0;
+        const alpha = count > 0 ? Math.max(0.14, intensity * 0.95) : 0;
+        return (
+          <div
+            key={d}
+            className="heatmap-cell"
+            style={{
+              background:
+                count > 0
+                  ? `rgba(96, 165, 250, ${alpha})`
+                  : "rgba(255,255,255,0.03)",
+            }}
+            title={`${WEEKDAYS[d]} ${hourStart}-${hourStart + 1}時: ${count}件`}
+          >
+            {count > 0 && max <= 9 ? (
+              <span className="heatmap-count">{count}</span>
+            ) : null}
+          </div>
+        );
+      })}
+    </>
   );
 }
 
-function MentionSlide({ summary }: { summary: Summary }) {
-  const top = summary.topMentions.slice(0, 5);
+/* ================
+   5. New follows
+   ================ */
+
+function NewFollowsSlide({ follows }: { follows: NewFollow[] }) {
+  if (follows.length === 0) {
+    return (
+      <div className="card grad-gold fill">
+        <div className="card-body center">
+          <div className="card-label">新しくフォローした友達</div>
+          <div className="huge-number">
+            <span>0</span>
+            <span className="huge-suffix">人</span>
+          </div>
+          <div className="card-caption">
+            この月は新しいフォローはありませんでした
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  const preview = follows.slice(0, 12);
+
   return (
-    <div className="card grad-purple fill">
+    <div className="card grad-gold fill">
       <div className="card-body">
-        <div className="card-label">よく話している相手</div>
-        <ul className="tag-list">
-          {top.map((m, i) => (
-            <li key={m.handle}>
-              <span className="tag-rank">#{i + 1}</span>
-              <span className="tag-label">@{m.handle}</span>
-              <span className="tag-count">{m.count}</span>
+        <div className="card-label">新しくフォローした友達</div>
+        <div className="follows-count">
+          <span className="follows-number">{follows.length}</span>
+          <span className="follows-suffix">人</span>
+        </div>
+        <ul className="follow-list">
+          {preview.map((f) => (
+            <li key={f.did} className="follow-item">
+              {f.avatar ? (
+                <img
+                  className="follow-avatar"
+                  src={f.avatar}
+                  alt=""
+                  loading="lazy"
+                />
+              ) : (
+                <div className="follow-avatar follow-fallback">
+                  {f.handle.charAt(0).toUpperCase()}
+                </div>
+              )}
+              <div className="follow-info">
+                <div className="follow-name">
+                  {f.displayName || f.handle}
+                </div>
+                <div className="follow-handle">@{f.handle}</div>
+              </div>
             </li>
           ))}
         </ul>
+        {follows.length > preview.length && (
+          <div className="follows-more">
+            +{follows.length - preview.length} 人
+          </div>
+        )}
       </div>
     </div>
   );
 }
 
-interface TopPostSlideProps {
+/* ================
+   6. Top post
+   ================ */
+
+interface TopPostProps {
   post: AnalyzedPost;
   profile: Profile;
 }
 
-function TopPostSlide({ post, profile }: TopPostSlideProps) {
+function TopPostSlide({ post, profile }: TopPostProps) {
   const rkey = post.uri.split("/").pop();
   const bskyUrl = `https://bsky.app/profile/${profile.handle}/post/${rkey}`;
   return (
@@ -748,6 +1112,7 @@ function TopPostSlide({ post, profile }: TopPostSlideProps) {
           href={bskyUrl}
           target="_blank"
           rel="noreferrer"
+          onPointerDown={(e) => e.stopPropagation()}
         >
           Bluesky で開く ↗
         </a>
@@ -756,90 +1121,139 @@ function TopPostSlide({ post, profile }: TopPostSlideProps) {
   );
 }
 
-interface FeedSlideProps {
-  posts: AnalyzedPost[];
+/* ================
+   7. Final summary (OGP-ready)
+   ================ */
+
+interface SummaryProps {
   profile: Profile;
+  summary: Summary;
+  engagers: Engager[];
+  newFollows: NewFollow[];
+  monthLabel: string;
+  authenticated: boolean;
+  persisted: boolean;
 }
 
-function FeedSlide({ posts, profile }: FeedSlideProps) {
+function SummarySlide({
+  profile,
+  summary,
+  engagers,
+  newFollows,
+  monthLabel,
+  authenticated,
+  persisted,
+}: SummaryProps) {
+  const topSupporters = engagers.slice(0, 5);
   return (
-    <div className="card card-feed fill">
-      <div className="card-body feed-body-wrap">
-        <div className="card-label feed-label">タイムライン</div>
-        <ul className="feed-list">
-          {posts.map((p) => (
-            <FeedItem key={p.uri} post={p} profile={profile} />
-          ))}
-        </ul>
+    <div className="card card-summary fill">
+      <div className="card-body summary-body">
+        <div className="summary-head">
+          <div className="summary-month">{monthLabel} · RECAP</div>
+          <div className="summary-profile">
+            {profile.avatar && (
+              <img
+                className="summary-avatar"
+                src={profile.avatar}
+                alt=""
+              />
+            )}
+            <div className="summary-profile-text">
+              <div className="summary-name">
+                {profile.displayName || profile.handle}
+              </div>
+              <div className="summary-handle">@{profile.handle}</div>
+            </div>
+          </div>
+        </div>
+
+        <div className="summary-grid">
+          <SummaryStat
+            label="投稿"
+            value={summary.total}
+            color="#60a5fa"
+          />
+          <SummaryStat
+            label="♥ いいね"
+            value={summary.totalLikes}
+            color="#f472b6"
+          />
+          <SummaryStat
+            label="🔁 リポスト"
+            value={summary.totalReposts}
+            color="#34d399"
+          />
+          <SummaryStat
+            label="💬 コメント"
+            value={summary.totalReplies}
+            color="#fbbf24"
+          />
+          <SummaryStat
+            label="❝ 引用"
+            value={summary.totalQuotes}
+            color="#c084fc"
+          />
+          <SummaryStat
+            label="新フォロー"
+            value={newFollows.length}
+            color="#fb923c"
+          />
+        </div>
+
+        {topSupporters.length > 0 && (
+          <div className="summary-supporters">
+            <div className="summary-thanks">thanks to</div>
+            <div className="supporter-avatars">
+              {topSupporters.map((e) => (
+                <div
+                  key={e.did}
+                  className="supporter-avatar"
+                  title={`@${e.handle}`}
+                >
+                  {e.avatar ? (
+                    <img src={e.avatar} alt="" loading="lazy" />
+                  ) : (
+                    <div className="supporter-fallback">
+                      {e.handle.charAt(0).toUpperCase()}
+                    </div>
+                  )}
+                </div>
+              ))}
+              {engagers.length > topSupporters.length && (
+                <div className="supporter-more">
+                  +{engagers.length - topSupporters.length}
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        <div className="summary-footer">
+          <span className="summary-brand">sky highlights</span>
+          {authenticated && persisted && (
+            <span className="summary-persist">✓ PDS に保存済み</span>
+          )}
+        </div>
       </div>
     </div>
   );
 }
 
-function FeedItem({ post, profile }: { post: AnalyzedPost; profile: Profile }) {
-  const rkey = post.uri.split("/").pop();
-  const bskyUrl = `https://bsky.app/profile/${profile.handle}/post/${rkey}`;
-  const isRepost = post.kind === "repost";
+function SummaryStat({
+  label,
+  value,
+  color,
+}: {
+  label: string;
+  value: number;
+  color: string;
+}) {
   return (
-    <li className="feed-item">
-      <div
-        className="feed-dot"
-        style={{ background: CHART_COLORS[post.kind] }}
-      />
-      <div className="feed-body">
-        <div className="feed-meta">
-          <span className={`kind-tag kind-${post.kind}`}>
-            {KIND_LABEL[post.kind]}
-          </span>
-          <span className="feed-time">{formatRelative(post.createdAt)}</span>
-        </div>
-        <p className={`feed-text ${isRepost ? "muted" : ""}`}>
-          {post.text || (isRepost ? "（リポスト元の投稿）" : "")}
-        </p>
-        {!isRepost ? (
-          <div className="feed-stats">
-            <span>♥ {post.likeCount}</span>
-            <span>🔁 {post.repostCount}</span>
-            <span>💬 {post.replyCount}</span>
-            <a href={bskyUrl} target="_blank" rel="noreferrer">
-              ↗
-            </a>
-          </div>
-        ) : (
-          <div className="feed-stats">
-            <a href={bskyUrl} target="_blank" rel="noreferrer">
-              元の投稿 ↗
-            </a>
-          </div>
-        )}
+    <div className="summary-stat">
+      <div className="summary-stat-value" style={{ color }}>
+        {value.toLocaleString()}
       </div>
-    </li>
+      <div className="summary-stat-label">{label}</div>
+    </div>
   );
-}
-
-const CHART_COLORS = {
-  original: "#60a5fa",
-  reply: "#fbbf24",
-  quote: "#c084fc",
-  repost: "#34d399",
-} as const;
-
-const KIND_LABEL: Record<string, string> = {
-  original: "オリジナル",
-  reply: "リプライ",
-  quote: "引用",
-  repost: "リポスト",
-};
-
-function formatRelative(d: Date): string {
-  const diff = Date.now() - d.getTime();
-  const s = Math.floor(diff / 1000);
-  if (s < 60) return `${s}秒前`;
-  const m = Math.floor(s / 60);
-  if (m < 60) return `${m}分前`;
-  const h = Math.floor(m / 60);
-  if (h < 24) return `${h}時間前`;
-  const day = Math.floor(h / 24);
-  if (day < 7) return `${day}日前`;
-  return d.toLocaleDateString("ja-JP");
 }

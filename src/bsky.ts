@@ -161,13 +161,14 @@ export async function fetchProfile(handle: string): Promise<Profile> {
   return (await res.json()) as Profile;
 }
 
-export async function fetchRecentPosts(
+export async function fetchPostsInRange(
   actor: string,
-  sinceMs: number,
+  startMs: number,
+  endMs: number,
 ): Promise<AnalyzedPost[]> {
   const out: AnalyzedPost[] = [];
   let cursor: string | undefined;
-  const MAX_PAGES = 10;
+  const MAX_PAGES = 20;
 
   for (let i = 0; i < MAX_PAGES; i++) {
     const params = new URLSearchParams({
@@ -187,10 +188,12 @@ export async function fetchRecentPosts(
 
     for (const item of json.feed) {
       const ts = pickTimestamp(item);
-      if (ts.getTime() < sinceMs) {
+      const tm = ts.getTime();
+      if (tm < startMs) {
         reachedEnd = true;
         continue;
       }
+      if (tm > endMs) continue;
       const analyzed = analyzeItem(item, actor, ts);
       if (analyzed) out.push(analyzed);
     }
@@ -199,6 +202,139 @@ export async function fetchRecentPosts(
     cursor = json.cursor;
   }
   return out;
+}
+
+export type NewFollow = {
+  did: string;
+  handle: string;
+  displayName?: string;
+  avatar?: string;
+  followedAt: Date;
+};
+
+type DidDocument = {
+  service?: Array<{
+    id: string;
+    type: string;
+    serviceEndpoint: string;
+  }>;
+};
+
+async function resolvePDS(did: string): Promise<string> {
+  try {
+    if (did.startsWith("did:plc:")) {
+      const res = await fetch(`https://plc.directory/${did}`);
+      if (!res.ok) return "https://bsky.social";
+      const doc = (await res.json()) as DidDocument;
+      const pds = doc.service?.find(
+        (s) =>
+          s.id === "#atproto_pds" ||
+          s.type === "AtprotoPersonalDataServer",
+      );
+      return pds?.serviceEndpoint ?? "https://bsky.social";
+    }
+    if (did.startsWith("did:web:")) {
+      const domain = did.slice("did:web:".length);
+      const res = await fetch(`https://${domain}/.well-known/did.json`);
+      if (!res.ok) return "https://bsky.social";
+      const doc = (await res.json()) as DidDocument;
+      const pds = doc.service?.find(
+        (s) =>
+          s.id === "#atproto_pds" ||
+          s.type === "AtprotoPersonalDataServer",
+      );
+      return pds?.serviceEndpoint ?? "https://bsky.social";
+    }
+  } catch {
+    // fallthrough
+  }
+  return "https://bsky.social";
+}
+
+export async function fetchNewFollows(
+  did: string,
+  startMs: number,
+  endMs: number,
+): Promise<NewFollow[]> {
+  const pds = await resolvePDS(did);
+  const follows: Array<{ subject: string; createdAt: string }> = [];
+  let cursor: string | undefined;
+
+  for (let i = 0; i < 30; i++) {
+    const params = new URLSearchParams({
+      repo: did,
+      collection: "app.bsky.graph.follow",
+      limit: "100",
+    });
+    if (cursor) params.set("cursor", cursor);
+    const url = `${pds}/xrpc/com.atproto.repo.listRecords?${params.toString()}`;
+    let res: Response;
+    try {
+      res = await fetch(url);
+    } catch {
+      break;
+    }
+    if (!res.ok) break;
+    const json = (await res.json()) as {
+      records?: Array<{
+        uri: string;
+        value: { subject: string; createdAt: string };
+      }>;
+      cursor?: string;
+    };
+    let stop = false;
+    for (const rec of json.records ?? []) {
+      const ca = new Date(rec.value.createdAt).getTime();
+      if (isNaN(ca)) continue;
+      if (ca < startMs) {
+        stop = true;
+        continue;
+      }
+      if (ca > endMs) continue;
+      follows.push({
+        subject: rec.value.subject,
+        createdAt: rec.value.createdAt,
+      });
+    }
+    if (stop || !json.cursor) break;
+    cursor = json.cursor;
+  }
+
+  if (follows.length === 0) return [];
+
+  const byDid = new Map(follows.map((f) => [f.subject, f.createdAt]));
+  const results: NewFollow[] = [];
+
+  for (let i = 0; i < follows.length; i += 25) {
+    const batch = follows.slice(i, i + 25);
+    const params = batch
+      .map((f) => `actors=${encodeURIComponent(f.subject)}`)
+      .join("&");
+    try {
+      const res = await fetch(
+        `${PUBLIC_APPVIEW}/xrpc/app.bsky.actor.getProfiles?${params}`,
+      );
+      if (!res.ok) continue;
+      const json = (await res.json()) as { profiles?: ActorLite[] };
+      for (const p of json.profiles ?? []) {
+        const createdAt = byDid.get(p.did);
+        if (!createdAt) continue;
+        results.push({
+          did: p.did,
+          handle: p.handle,
+          displayName: p.displayName,
+          avatar: p.avatar,
+          followedAt: new Date(createdAt),
+        });
+      }
+    } catch {
+      // skip
+    }
+  }
+
+  return results.sort(
+    (a, b) => b.followedAt.getTime() - a.followedAt.getTime(),
+  );
 }
 
 function pickTimestamp(item: FeedItem): Date {

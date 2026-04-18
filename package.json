@@ -10,6 +10,8 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@atproto/api": "^0.19.9",
+    "@atproto/oauth-client-browser": "^0.3.41",
     "chart.js": "^4.5.1",
     "react": "^19.2.4",
     "react-chartjs-2": "^5.3.1",
